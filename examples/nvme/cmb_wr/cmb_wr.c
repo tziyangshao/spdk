@@ -105,11 +105,15 @@ check_io(void *arg, const struct spdk_nvme_cpl *completion)
 }
 
 static int
-cmb_copy(void)
+cmb_wr(void)
 {
+#define TEST_PATTERN_BYTES 0xff
 	int rc = 0, rw;
 	void *buf;
 	size_t sz;
+	uint32_t i = 0;
+	char* wr_buf= malloc(sizeof(char)*TEST_PATTERN_BYTES);
+	char* rd_buf= malloc(sizeof(char)*TEST_PATTERN_BYTES);
 
 	/* Allocate QPs for the read and write controllers */
 	g_config.read.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_config.read.ctrlr, NULL, 0);
@@ -128,22 +132,16 @@ cmb_copy(void)
 		return -ENOMEM;
 	}
 
+	// gen & write pattern using wr_buf address for TEST_PATTERN_BYTES element
+	for (i = 0; i < TEST_PATTERN_BYTES; i++)
+	{
+	    wr_buf[i]= i;
+	    *(char *)(buf + i) = wr_buf[i];
+	}
+
 	/* Clear the done flags */
 	g_config.read.done = 0;
 	g_config.write.done = 0;
-
-	rw = CMB_COPY_READ;
-	/* Do the read to the CMB IO buffer */
-	rc = spdk_nvme_ns_cmd_read(g_config.read.ns, g_config.read.qpair, buf,
-				   g_config.read.slba, g_config.read.nlbas,
-				   check_io, &rw, 0);
-	if (rc != 0) {
-		fprintf(stderr, "starting read I/O failed\n");
-		return -EIO;
-	}
-	while (!g_config.read.done) {
-		spdk_nvme_qpair_process_completions(g_config.read.qpair, 0);
-	}
 
 	/* Do the write from the CMB IO buffer */
 	rw = CMB_COPY_WRITE;
@@ -158,6 +156,25 @@ cmb_copy(void)
 		spdk_nvme_qpair_process_completions(g_config.write.qpair, 0);
 	}
 
+	rw = CMB_COPY_READ;
+	/* Do the read to the CMB IO buffer */
+	rc = spdk_nvme_ns_cmd_read(g_config.read.ns, g_config.read.qpair, buf,
+				   g_config.read.slba, g_config.read.nlbas,
+				   check_io, &rw, 0);
+	if (rc != 0) {
+		fprintf(stderr, "starting read I/O failed\n");
+		return -EIO;
+	}
+	while (!g_config.read.done) {
+		spdk_nvme_qpair_process_completions(g_config.read.qpair, 0);
+	}
+
+	// write pattern of 100
+	for (i = 0; i < TEST_PATTERN_BYTES; i++)
+	{
+	    rd_buf[i] = *(char *)(buf + i);
+	}
+
 	/* Clear the done flags */
 	g_config.read.done = 0;
 	g_config.write.done = 0;
@@ -168,6 +185,16 @@ cmb_copy(void)
 	/* Free the queues */
 	spdk_nvme_ctrlr_free_io_qpair(g_config.read.qpair);
 	spdk_nvme_ctrlr_free_io_qpair(g_config.write.qpair);
+
+	for (i = 0; i < TEST_PATTERN_BYTES; i++)
+	{
+	    if (rd_buf[i] != wr_buf[i])
+	    {
+	        printf("CMB READ not equals to CMB WRITE, test failed\n");
+	        return -EIO;
+            }
+	}
+	printf("UNH 3_11 CMB test passed!\n");
 
 	return rc;
 }
@@ -220,11 +247,10 @@ usage(char *program_name)
 {
 	printf("%s options (all mandatory)", program_name);
 	printf("\n");
-	printf("\t[-r NVMe read parameters]\n");
-	printf("\t[-w NVMe write parameters]\n");
+	printf("\t[-t NVMe target parameters]\n");
 	printf("\t[-c CMB to use for data buffers]\n");
 	printf("\n");
-	printf("Read/Write params:\n");
+	printf("target params:\n");
 	printf("  <pci id>-<namespace>-<start LBA>-<number of LBAs>\n");
 }
 
@@ -289,14 +315,11 @@ parse_args(int argc, char **argv)
 	int op;
 	unsigned read = 0, write = 0, cmb = 0;
 
-	while ((op = getopt(argc, argv, "r:w:c:")) != -1) {
+	while ((op = getopt(argc, argv, "t:c:")) != -1) {
 		switch (op) {
-		case 'r':
+		case 't':
 			parse(optarg, &g_config.read);
 			read = 1;
-			break;
-		case 'w':
-			parse(optarg, &g_config.write);
 			write = 1;
 			break;
 		case 'c':
@@ -344,7 +367,7 @@ int main(int argc, char **argv)
 	 *
 	 */
 	spdk_env_opts_init(&opts);
-	opts.name = "cmb_copy";
+	opts.name = "cmb_wr";
 	opts.shm_id = 0;
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
@@ -363,50 +386,19 @@ int main(int argc, char **argv)
 			rc);
 		return -1;
 	}
-
-	/*
-	 * For now enforce that the read and write controller are not
-	 * the same. This avoids an internal only DMA.
-	 */
-	if (!strcmp(g_config.write.trid.traddr, g_config.read.trid.traddr)) {
-		fprintf(stderr, "Read and Write controllers must differ!\n");
-		return -1;
-	}
-
-	/*
-	 * Perform a few sanity checks and set the buffer size for the
-	 * CMB.
-	 */
-	if (g_config.read.nlbas * g_config.read.lba_size !=
-	    g_config.write.nlbas * g_config.write.lba_size) {
-		fprintf(stderr, "Read and write sizes do not match!\n");
-		return -1;
-	}
 	g_config.copy_size = g_config.read.nlbas * g_config.read.lba_size;
+	g_config.write = g_config.read;
+	g_config.cmb.ctrlr = g_config.read.ctrlr;
 
 	/*
-	 * Get the ctrlr pointer for the CMB. For now we assume this
-	 * is either the read or write NVMe controller though in
-	 * theory that is not a necessary condition.
-	 */
-
-	if (!strcmp(g_config.cmb.trid.traddr, g_config.read.trid.traddr)) {
-		g_config.cmb.ctrlr = g_config.read.ctrlr;
-	}
-	if (!strcmp(g_config.cmb.trid.traddr, g_config.write.trid.traddr)) {
-		g_config.cmb.ctrlr = g_config.write.ctrlr;
-	}
-
-	/*
-	 * Call the cmb_copy() function which performs the CMB
+	 * Call the cmb_wr() function which performs the CMB
 	 * based copy or returns an error code if it fails.
 	 */
-	rc = cmb_copy();
+	rc = cmb_wr();
 	if (rc) {
-		fprintf(stderr, "Error in spdk_cmb_copy(): %d\n",
+		fprintf(stderr, "Error in spdk_cmb_wr(): %d\n",
 			rc);
 		return -1;
 	}
-
 	return rc;
 }
